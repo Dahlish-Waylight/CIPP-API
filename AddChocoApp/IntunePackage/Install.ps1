@@ -34,31 +34,17 @@ try {
     }
 
     try {
-    $localprograms = & "$chocoPath" list --localonly
-    $arguments = @()
-
-    if ($localprograms -like "*$Packagename*") {
-        Write-Host "Upgrading $Packagename"
-        $arguments = @("upgrade", $Packagename, "-y")
-    }
-    else {
-        Write-Host "Installing $Packagename"
-        $arguments = @("install", $Packagename, "-y")
-    }
-
-    # Add custom repo source if provided
-    if ($CustomRepo) { 
-        $arguments += "--source"; 
-        $arguments += $CustomRepo 
-    }
-
-    # Debugging output to see the full command before execution
-    Write-Host "Executing: $chocoPath $($arguments -join ' ')"
-
-    # Run Chocolatey with correct argument handling
-    & "$chocoPath" @arguments
-
-    Write-Host "Completed."
+        $localprograms = & "$chocoPath" list --localonly
+        $CustomRepoString = if ($CustomRepo) { "--source $customrepo" } else { $null }
+        if ($localprograms -like "*$Packagename*" ) {
+            Write-Host "Upgrading $packagename"
+            & "$chocoPath" upgrade $Packagename $CustomRepoString
+        }
+        else {
+            Write-Host "Installing $packagename"
+            & "$chocoPath" install $Packagename -y $CustomRepoString
+        }
+        Write-Host 'Completed.'
     }  
     catch {
         Write-Host "Install/upgrade error: $($_.Exception.Message)"
@@ -66,7 +52,7 @@ try {
 
 }
 catch {
-    Write-Host "Install/upgrade error: $($_.Exception.Message)"
+    Write-Host "Error encountered: $($_.Exception.Message)"
 }
 finally {
     if ($Trace) { Stop-Transcript }
