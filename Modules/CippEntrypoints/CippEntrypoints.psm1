@@ -230,10 +230,6 @@ function Receive-CippOrchestrationTrigger {
             BackoffCoefficient  = 2
         }
 
-        if ($env:WEBSITE_SKU -match '^Premium') {
-            $OrchestratorInput | Add-Member -MemberType NoteProperty -Name DurableMode -Value 'FanOut' -Force
-        }
-
         switch ($OrchestratorInput.DurableMode) {
             'FanOut' {
                 $DurableMode = 'FanOut'
@@ -255,14 +251,10 @@ function Receive-CippOrchestrationTrigger {
         Write-Information "Durable Mode: $DurableMode"
 
         $RetryOptions = New-DurableRetryOptions @DurableRetryOptions
-
-        $HasBatch = $OrchestratorInput.Batch -and @($OrchestratorInput.Batch).Count -gt 0
-        $HasQueueFunction = $null -ne $OrchestratorInput.QueueFunction -and $OrchestratorInput.QueueFunction -ne ''
-
-        if ($HasBatch) {
-            $Batch = $OrchestratorInput.Batch | Where-Object { $null -ne $_.FunctionName }
-        } elseif ($HasQueueFunction) {
+        if (!$OrchestratorInput.Batch -or ($OrchestratorInput.Batch | Measure-Object).Count -eq 0 -and $OrchestratorInput.QueueFunction) {
             $Batch = (Invoke-ActivityFunction -FunctionName 'CIPPActivityFunction' -Input $OrchestratorInput.QueueFunction -ErrorAction Stop) | Where-Object { $null -ne $_.FunctionName }
+        } elseif ($OrchestratorInput.Batch) {
+            $Batch = $OrchestratorInput.Batch | Where-Object { $null -ne $_.FunctionName }
         } else {
             Write-Information 'No batch or queue function provided to orchestrator input'
             $Batch = @()
@@ -439,6 +431,8 @@ function Receive-CippActivityTrigger {
                 }
             } catch {
                 $ErrorMsg = $_.Exception.Message
+                Write-Information "Error in activity function $FunctionName : $ErrorMsg"
+                Write-Information $_.InvocationInfo.PositionMessage
                 $Status = 'Failed'
                 if ($TaskStatus) {
                     $QueueTask.Status = 'Failed'
@@ -456,6 +450,7 @@ function Receive-CippActivityTrigger {
         }
     } catch {
         Write-Error "Error in Receive-CippActivityTrigger: $($_.Exception.Message)"
+        Write-Error $_.InvocationInfo.PositionMessage
         $Status = 'Failed'
         $Output = $null
         if ($TaskStatus) {
@@ -486,54 +481,6 @@ function Receive-CIPPTimerTrigger {
     param($Timer)
 
     $UtcNow = (Get-Date).ToUniversalTime()
-
-    try {
-        #temporary orphan check - Remove at next release.
-        $OrphanConfigTable = Get-CIPPTable -tablename 'Config'
-        $OrphanFlag = Get-CIPPAzDataTableEntity @OrphanConfigTable -Filter "PartitionKey eq 'OrphanRequeue' and RowKey eq 'OrphanRequeue'" -ErrorAction SilentlyContinue
-        if (-not $OrphanFlag -or $OrphanFlag.state -ne $true) {
-            $OrchestratorTable = Get-CIPPTable -TableName 'CippOrchestratorInput'
-            $OrphanedInputs = Get-CIPPAzDataTableEntity @OrchestratorTable -Filter "PartitionKey eq 'Input'"
-            $CutoffTime = $UtcNow.AddMinutes(-5)
-            $MaxAge = $UtcNow.AddHours(-24)
-            $StaleOrphans = @($OrphanedInputs | Where-Object { $_.Timestamp.DateTime -lt $CutoffTime -and $_.Timestamp.DateTime -gt $MaxAge })
-            if ($StaleOrphans.Count -gt 0) {
-                Write-Information "Found $($StaleOrphans.Count) orphaned orchestration inputs, re-queuing..."
-                foreach ($Orphan in $StaleOrphans) {
-                    try {
-                        Add-CippQueueMessage -Cmdlet 'Start-CIPPOrchestrator' -Parameters @{ InputObjectGuid = $Orphan.RowKey }
-                        Write-Information "Re-queued orphaned orchestration: $($Orphan.RowKey)"
-                    } catch {
-                        Write-Warning "Failed to re-queue orphan $($Orphan.RowKey): $($_.Exception.Message)"
-                    }
-                }
-                Write-LogMessage -API 'TimerFunction' -message "Re-queued $($StaleOrphans.Count) orphaned orchestration inputs" -sev Info
-            }
-            # Clean up orphans older than 24h - too stale to run
-            $ExpiredOrphans = @($OrphanedInputs | Where-Object { $_.Timestamp.DateTime -le $MaxAge })
-            if ($ExpiredOrphans.Count -gt 0) {
-                Write-Information "Removing $($ExpiredOrphans.Count) expired orphaned inputs (older than 24h)..."
-                foreach ($Expired in $ExpiredOrphans) {
-                    try {
-                        Remove-AzDataTableEntity @OrchestratorTable -Entity $Expired -Force
-                    } catch {
-                        Write-Warning "Failed to remove expired orphan $($Expired.RowKey): $($_.Exception.Message)"
-                    }
-                }
-            }
-            # Mark as completed so we don't scan again
-            $null = Add-CIPPAzDataTableEntity @OrphanConfigTable -Entity @{
-                PartitionKey = 'OrphanRequeue'
-                RowKey       = 'OrphanRequeue'
-                state        = $true
-                Timestamp    = $UtcNow
-                Count        = $StaleOrphans.Count
-            } -Force
-        }
-    } catch {
-        Write-Warning "Orphan re-queue check failed: $($_.Exception.Message)"
-    }
-
     $Functions = Get-CIPPTimerFunctions
     $Table = Get-CIPPTable -tablename CIPPTimers
     $Statuses = Get-CIPPAzDataTableEntity @Table
@@ -596,7 +543,6 @@ function Receive-CIPPTimerTrigger {
 
             $Results = Invoke-Command -ScriptBlock { & $Function.Command @Parameters }
 
-
             if ($Results -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
                 $FunctionStatus.OrchestratorId = $Results -join ','
                 $Status = 'Started'
@@ -622,5 +568,4 @@ function Receive-CIPPTimerTrigger {
 }
 
 Export-ModuleMember -Function @('Receive-CippHttpTrigger', 'Receive-CippQueueTrigger', 'Receive-CippOrchestrationTrigger', 'Receive-CippActivityTrigger', 'Receive-CIPPTimerTrigger')
-
 
